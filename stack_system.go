@@ -332,6 +332,7 @@ func (s *System) acceptLoop(listener net.Listener) {
 		session := s.tcpNat.LookupBack(connPort)
 		if session == nil {
 			s.logger.Trace(E.New("unknown session with port ", connPort))
+			_ = conn.Close()
 			continue
 		}
 		go s.handler.NewConnectionEx(s.ctx, conn, M.SocksaddrFromNetIP(session.Source), M.SocksaddrFromNetIP(session.Destination), nil)
