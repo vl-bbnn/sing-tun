@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,6 +42,9 @@ type System struct {
 	inet6LoopbackAddress []netip.Addr
 	udpTimeout           time.Duration
 	icmpTimeout          time.Duration
+	localTCPDiagnostic   localTCPDiagnosticState
+	listenerAccess       sync.Mutex
+	listenerCloseStarted atomic.Bool
 	tcpListener          net.Listener
 	tcpListener6         net.Listener
 	tcpPort              uint16
@@ -101,10 +106,14 @@ func NewSystem(options StackOptions) (Stack, error) {
 }
 
 func (s *System) Close() error {
-	return common.Close(
-		s.tcpListener,
-		s.tcpListener6,
-	)
+	// Seal before waiting for an in-flight rebind. A listener opened during
+	// this wait is closed by its creator and cannot be published afterward.
+	s.listenerCloseStarted.Store(true)
+	s.observeLocalTCP("close_called", netip.AddrPort{}, netip.AddrPort{}, 0, "none")
+	s.listenerAccess.Lock()
+	listener4, listener6 := s.tcpListener, s.tcpListener6
+	s.listenerAccess.Unlock()
+	return common.Close(listener4, listener6)
 }
 
 func (s *System) Start() error {
@@ -141,9 +150,16 @@ func (s *System) start() error {
 		if err != nil {
 			return err
 		}
+		s.listenerAccess.Lock()
+		if s.listenerCloseStarted.Load() || s.ctx.Err() != nil {
+			s.listenerAccess.Unlock()
+			_ = tcpListener.Close()
+			return net.ErrClosed
+		}
 		s.tcpListener = tcpListener
 		s.tcpPort = M.SocksaddrFromNet(tcpListener.Addr()).Port
-		go s.acceptLoop(tcpListener)
+		s.observeLocalTCP("ipv4_listener_ready", netip.AddrPort{}, netip.AddrPort{}, s.tcpPort, "none")
+		s.listenerAccess.Unlock()
 	}
 	if s.inet6NextAddress.IsValid() {
 		for i := 0; i < 3; i++ {
@@ -156,13 +172,34 @@ func (s *System) start() error {
 		if err != nil {
 			return err
 		}
+		s.listenerAccess.Lock()
+		if s.listenerCloseStarted.Load() || s.ctx.Err() != nil {
+			s.listenerAccess.Unlock()
+			_ = tcpListener.Close()
+			return net.ErrClosed
+		}
 		s.tcpListener6 = tcpListener
 		s.tcpPort6 = M.SocksaddrFromNet(tcpListener.Addr()).Port
-		go s.acceptLoop(tcpListener)
+		s.observeLocalTCP("ipv6_listener_ready", netip.AddrPort{}, netip.AddrPort{}, s.tcpPort6, "none")
+		s.listenerAccess.Unlock()
 	}
 	s.tcpNat = NewNat(s.ctx, s.udpTimeout)
 	s.udpNat = udpnat.New(s.handler, s.preparePacketConnection, s.udpTimeout, false)
 	s.directNat = NewDirectRouteMapping(s.icmpTimeout)
+	// Publish NAT state before any Accept can expose a connection to the handler.
+	s.listenerAccess.Lock()
+	if s.listenerCloseStarted.Load() || s.ctx.Err() != nil {
+		s.listenerAccess.Unlock()
+		return net.ErrClosed
+	}
+	listener4, listener6 := s.tcpListener, s.tcpListener6
+	s.listenerAccess.Unlock()
+	if listener4 != nil {
+		go s.acceptLoop(listener4)
+	}
+	if listener6 != nil {
+		go s.acceptLoop(listener6)
+	}
 	return nil
 }
 
@@ -323,15 +360,34 @@ func (s *System) processPacket(packet []byte) bool {
 }
 
 func (s *System) acceptLoop(listener net.Listener) {
+	consecutiveRebinds := 0
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			s.observeLocalTCPAcceptError(listener, err)
+			// Android can externally invalidate a listening socket during VPN
+			// address cleanup without closing its Go owner. EINVAL is the
+			// kernel's invalid LISTEN state, not an ordinary requested Close.
+			if errors.Is(err, syscall.EINVAL) && consecutiveRebinds < tcpListenerRebindLimit {
+				replacement, rebindErr := s.rebindTCPListener(listener)
+				if rebindErr == nil {
+					listener = replacement
+					consecutiveRebinds++
+					continue
+				}
+				if !E.IsClosed(rebindErr) {
+					s.logger.Error(E.Cause(rebindErr, "rebind TCP forwarder"))
+				}
+			}
 			return
 		}
+		consecutiveRebinds = 0
 		connPort := M.SocksaddrFromNet(conn.RemoteAddr()).Port
 		session := s.tcpNat.LookupBack(connPort)
 		if session == nil {
+			s.observeLocalTCP("unknown_session", M.SocksaddrFromNet(conn.RemoteAddr()).AddrPort(), netip.AddrPort{}, 0, "unknown_session")
 			s.logger.Trace(E.New("unknown session with port ", connPort))
+			_ = conn.Close()
 			continue
 		}
 		go s.handler.NewConnectionEx(s.ctx, conn, M.SocksaddrFromNetIP(session.Source), M.SocksaddrFromNetIP(session.Destination), nil)
@@ -380,6 +436,7 @@ func (s *System) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 }
 
 func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, error) {
+	s.observeLocalTCPPacket(ipHdr, tcpHdr)
 	source := netip.AddrPortFrom(ipHdr.SourceAddr(), tcpHdr.SourcePort())
 	destination := netip.AddrPortFrom(ipHdr.DestinationAddr(), tcpHdr.DestinationPort())
 	if !destination.Addr().IsGlobalUnicast() {
@@ -406,6 +463,7 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 		if !loopback {
 			natPort, err := s.tcpNat.Lookup(source, destination, s.handler)
 			if err != nil {
+				s.observeLocalTCP("nat_prepare_error", source, destination, uint16(tcpHdr.Flags()), localTCPErrorClass(err))
 				if errors.Is(err, ErrDrop) {
 					return false, nil
 				} else {
@@ -501,6 +559,7 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 		if !loopback {
 			natPort, err := s.tcpNat.Lookup(source, destination, s.handler)
 			if err != nil {
+				s.observeLocalTCP("nat_prepare_error", source, destination, uint16(tcpHdr.Flags()), localTCPErrorClass(err))
 				if errors.Is(err, ErrDrop) {
 					return false, nil
 				} else {

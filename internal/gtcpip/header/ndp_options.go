@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/netip"
 	"time"
 
 	"github.com/sagernet/sing-tun/internal/gtcpip"
@@ -698,7 +699,11 @@ func (o NDPRecursiveDNSServer) String() string {
 	if err != nil {
 		return fmt.Sprintf("%T([] valid for %s; err = %s)", o, lt, err)
 	}
-	return fmt.Sprintf("%T(%s valid for %s)", o, addrs, lt)
+	formatted := make([]netip.Addr, len(addrs))
+	for i, address := range addrs {
+		formatted[i] = netip.AddrFrom16(address.As16())
+	}
+	return fmt.Sprintf("%T(%v valid for %s)", o, formatted, lt)
 }
 
 // Lifetime returns the length of time that the DNS server addresses
@@ -747,7 +752,7 @@ func (o NDPRecursiveDNSServer) iterAddresses(fn func(tcpip.Address)) error {
 	for i := 0; len(o) != 0; i++ {
 		addr := tcpip.AddrFrom16Slice(o[:IPv6AddressSize])
 		if !IsV6UnicastAddress(addr) {
-			return fmt.Errorf("%d-th address (%s) in NDP Recursive DNS Server option is not a valid unicast IPv6 address: %w", i, addr, ErrNDPOptMalformedBody)
+			return fmt.Errorf("%d-th address (%s) in NDP Recursive DNS Server option is not a valid unicast IPv6 address: %w", i, netip.AddrFrom16(addr.As16()), ErrNDPOptMalformedBody)
 		}
 
 		if fn != nil {

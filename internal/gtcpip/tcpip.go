@@ -276,7 +276,7 @@ func (a Address) MatchingPrefix(b Address) uint8 {
 	const bitsInAByte = 8
 
 	if a.Len() != b.Len() {
-		panic(fmt.Sprintf("addresses %s and %s do not have the same length", a, b))
+		panic(fmt.Sprintf("addresses %s and %s do not have the same length", net.IP(a.AsSlice()), net.IP(b.AsSlice())))
 	}
 
 	var prefix uint8
@@ -390,7 +390,8 @@ func NewSubnet(a Address, m AddressMask) (Subnet, error) {
 
 // String implements Stringer.
 func (s Subnet) String() string {
-	return fmt.Sprintf("%s/%d", s.ID(), s.Prefix())
+	address := s.ID()
+	return fmt.Sprintf("%s/%d", net.IP(address.AsSlice()), s.Prefix())
 }
 
 // Contains returns true iff the address is of the same length and matches the
@@ -524,7 +525,7 @@ type AddressWithPrefix struct {
 
 // String implements the fmt.Stringer interface.
 func (a AddressWithPrefix) String() string {
-	return fmt.Sprintf("%s/%d", a.Address, a.PrefixLen)
+	return fmt.Sprintf("%s/%d", net.IP(a.Address.AsSlice()), a.PrefixLen)
 }
 
 // Subnet converts the address and prefix into a Subnet value and returns it.
